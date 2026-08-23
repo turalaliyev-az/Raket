@@ -4,14 +4,18 @@
 #include <STM32FreeRTOS.h>
 #include <string.h>
 
-HardwareSerial Serial1(PA10, PA9);   
-HardwareSerial Serial2(PA3, PA2);    
+HardwareSerial Serial1(PA10, PA9);    
+HardwareSerial Serial2(PA3, PA2);       
 HardwareSerial Serial3(PB11, PB10);  
-HardwareSerial Serial6(PC7, PC6);    
+HardwareSerial Serial6(PC7, PC6);     
 
 #define BUZZER_PIN PE9
-#define PIN_APOGEE PD12   
-#define PIN_MAIN   PD13   
+#define PIN_APOGEE PD12    
+#define PIN_MAIN   PD13    
+
+// --- PRE-CALCULATED RECIPROCALS (Ön hesablanmış tərs ədədlər) ---
+#define RECIPROCAL_DT 50.0f           // 1.0f / 0.02f
+#define RECIPROCAL_G 0.1019368f       // 1.0f / 9.81f
 
 struct SensorData {
   float qw=1, qx=0, qy=0, qz=0;
@@ -24,6 +28,9 @@ struct SensorData {
   float angle_x=0, angle_y=0, angle_z=0;
   bool apogee_fired = false;
   bool main_fired = false;
+  float total_g = 1.0f;
+  float vertical_speed = 0.0f;
+  bool is_landed = false;
 };
 
 struct Kalman1D {
@@ -57,7 +64,7 @@ struct QuatSlerp {
 
 SensorData shared;
 SemaphoreHandle_t i2c_mutex, data_mutex;
-Kalman1D kf_bme_temp, kf_bme_hum, kf_bme_pres, kf_aht_temp, kf_aht_hum, kf_altitude;
+Kalman1D kf_bme_temp, kf_bme_hum, kf_bme_pres, kf_aht_temp, kf_aht_hum, kf_altitude, kf_vspeed;
 QuatSlerp qslerp;
 volatile float max_flight_alt = 0.0f;
 
@@ -170,53 +177,99 @@ void parse_gps_line(char *line) {
 void play_buzzer_tone(int frequency, int duration_ms) { tone(BUZZER_PIN, frequency, duration_ms); }
 
 // ════════════════════════════════════════════════════════════
-//  RAKET: UÇUŞ MƏNTİQİ (ŞƏRTNAMƏYƏ UYĞUN)
+//  RAKET: UÇUŞ MƏNTİQİ VƏ ENİŞ DETEKSİYASI (OPTİMİZE)
 // ════════════════════════════════════════════════════════════
 void flight_control_task(void*) {
   TickType_t t = xTaskGetTickCount();
+  static float prev_alt = 0.0f;
+  static uint32_t landing_counter = 0;
+
   for (;;) {
-    float cur_alt, cur_ay, cur_az; 
-    bool ap_fired, mn_fired;
+    // BÜTÜN LAZIMLI DƏYƏRLƏRİ BİR DƏFƏYƏ OXU
     xSemaphoreTake(data_mutex, portMAX_DELAY);
-    cur_alt = shared.altitude; cur_ay = shared.angle_y; cur_az = shared.angle_z; 
-    ap_fired = shared.apogee_fired; mn_fired = shared.main_fired;
+    float cur_alt = shared.altitude;
+    float cur_ay = shared.angle_y;
+    float cur_az = shared.angle_z;
+    float ax = shared.accel_x;
+    float ay = shared.accel_y;
+    float az = shared.accel_z;
+    bool ap_fired = shared.apogee_fired;
+    bool mn_fired = shared.main_fired;
+    bool is_landed = shared.is_landed;
     xSemaphoreGive(data_mutex);
 
+    // Maksimum hündürlük yenilənməsi
     if (cur_alt > max_flight_alt) max_flight_alt = cur_alt;
 
-    // Təhlükəsizlik (Arming): Raket yerdən 50m qalxmadan pinlər aktivləşmir.
-    // (Masada test edirsinizsə, müvəqqəti olaraq bunu "-10.0f" edə bilərsiniz)
-    if (max_flight_alt > 50.0f) { 
+    // --- 1. DİKEY SÜRƏT HESABLAMASI (OPTİMİZE: Bölmə → Vurma) ---
+    // Sürət = (Δhündürlük) * (1/dt) = (cur_alt - prev_alt) * 50.0f
+    float raw_vspeed = (cur_alt - prev_alt) * RECIPROCAL_DT;  // / 0.02f əvəzinə * 50.0f
+    prev_alt = cur_alt;
+    float filtered_vspeed = kf_vspeed.update(raw_vspeed);
+
+    // --- 2. G QÜVVƏSİ HESABLAMASI (OPTİMİZE: Bölmə → Vurma) ---
+    // G = sqrt(ax² + ay² + az²) * (1/9.81) = magnitude * 0.1019368f
+    float accel_magnitude_sq = ax * ax + ay * ay + az * az;
+    float g_force = sqrtf(accel_magnitude_sq) * RECIPROCAL_G;  // / 9.81f əvəzinə * 0.1019368f
+
+    // --- 3. YENİLƏNMİŞ DƏYƏRLƏRİ BİR DƏFƏYƏ YAZ ---
+    xSemaphoreTake(data_mutex, portMAX_DELAY);
+    shared.vertical_speed = filtered_vspeed;
+    shared.total_g = g_force;
+    xSemaphoreGive(data_mutex);
+
+    // --- 4. TƏHLÜKƏSİZLİK VƏ UÇUŞ MƏNTİQİ ---
+    if (max_flight_alt > 50.0f) {  
       
-      // 1. APOGEE (DROGUE) PARAŞÜTÜ - Zirvədən sonra açılır
+      // Apogee (Drogue) Paraşütü
       if (!ap_fired) {
         bool is_falling = (cur_alt < (max_flight_alt - 3.0f));
         float tilt_angle = max(fabs(cur_ay), fabs(cur_az)); 
         bool is_tilted = (tilt_angle > 60.0f);
 
         if (is_falling || is_tilted) {
-          xSemaphoreTake(data_mutex, portMAX_DELAY); shared.apogee_fired = true; xSemaphoreGive(data_mutex);
+          xSemaphoreTake(data_mutex, portMAX_DELAY); 
+          shared.apogee_fired = true; 
+          xSemaphoreGive(data_mutex);
           digitalWrite(PIN_APOGEE, HIGH); 
           play_buzzer_tone(1500, 500);
+          ap_fired = true;  // Lokal dəyişəni yenilə
         }
       }
       
-      // 2. MAIN (ƏSAS) PARAŞÜT - Apogee açıldıqdan sonra 500 metrə düşdükdə açılır
+      // Main (Əsas) Paraşüt
       if (ap_fired && !mn_fired) {
-        if (cur_alt <= 500.0f) { // Şərtnaməyə uyğun 500 metr
-          xSemaphoreTake(data_mutex, portMAX_DELAY); shared.main_fired = true; xSemaphoreGive(data_mutex);
+        if (cur_alt <= 500.0f) { 
+          xSemaphoreTake(data_mutex, portMAX_DELAY); 
+          shared.main_fired = true; 
+          xSemaphoreGive(data_mutex);
           digitalWrite(PIN_MAIN, HIGH); 
           play_buzzer_tone(2000, 800);
+          mn_fired = true;  // Lokal dəyişəni yenilə
+        }
+      }
+
+      // --- 5. YERƏ OTURMA (LANDING) DETEKSİYASI ---
+      if (mn_fired && !is_landed) {
+        if (cur_alt < 5.0f && fabs(filtered_vspeed) < 0.5f) {
+          landing_counter++;
+          if (landing_counter > 100) {  // 2 saniyə (100 * 20ms)
+            xSemaphoreTake(data_mutex, portMAX_DELAY);
+            shared.is_landed = true;
+            xSemaphoreGive(data_mutex);
+            play_buzzer_tone(3000, 2000);
+            is_landed = true;  // Lokal dəyişəni yenilə
+          }
+        } else {
+          landing_counter = 0;
         }
       }
     }
+
     vTaskDelayUntil(&t, pdMS_TO_TICKS(20)); 
   }
 }
 
-// ════════════════════════════════════════════════════════════
-//  ENV TASK (AHT20 Non-Blocking, 50Hz)
-// ════════════════════════════════════════════════════════════
 void env_task(void*) {
   TickType_t t = xTaskGetTickCount();
   uint8_t aht_counter = 0;
@@ -236,7 +289,7 @@ void env_task(void*) {
     
     aht_counter++;
     bool aht_ok = false; float at=0, ah=0;
-    if (aht_counter >= 5) { // Hər 100ms-dən bir AHT20-ni oxu
+    if (aht_counter >= 5) { 
       aht_counter = 0; 
       if (i2c_should_try(health_aht, now)) { 
         xSemaphoreTake(i2c_mutex, portMAX_DELAY); 
@@ -255,7 +308,7 @@ void env_task(void*) {
     if (aht_ok) { shared.aht_temp = kf_aht_temp.update(at); shared.aht_hum = kf_aht_hum.update(ah); }
     xSemaphoreGive(data_mutex);
     
-    vTaskDelayUntil(&t, pdMS_TO_TICKS(20)); // 50 Hz dövrü
+    vTaskDelayUntil(&t, pdMS_TO_TICKS(20)); 
   }
 }
 
@@ -275,6 +328,9 @@ void tx_task(void*) {
     
     Serial3.print(','); Serial3.print(snap.apogee_fired ? 1 : 0);
     Serial3.print(','); Serial3.print(snap.main_fired ? 1 : 0);
+    Serial3.print(','); Serial3.print(snap.total_g, 2);
+    Serial3.print(','); Serial3.print(snap.vertical_speed, 2);
+    Serial3.print(','); Serial3.print(snap.is_landed ? 1 : 0);
 
     Serial3.println();
     vTaskDelayUntil(&t, pdMS_TO_TICKS(66)); 
@@ -302,6 +358,7 @@ void imu_task(void*) {
     vTaskDelayUntil(&t, pdMS_TO_TICKS(20));
   }
 }
+
 void gps_task(void*) {
   static char gps_buf[100]; static int buf_idx = 0;
   for (;;) {
@@ -325,6 +382,7 @@ void setup() {
   
   kf_bme_temp.init(0.005f, 0.25f); kf_bme_hum.init(0.05f, 9.0f); kf_bme_pres.init(0.05f, 1.0f);
   kf_altitude.init(0.1f, 4.0f); kf_aht_temp.init(0.005f, 0.09f); kf_aht_hum.init(0.05f, 4.0f); qslerp.init(0.15f);
+  kf_vspeed.init(0.1f, 2.0f);
   
   i2c_mutex = xSemaphoreCreateMutex(); data_mutex = xSemaphoreCreateMutex();
   
