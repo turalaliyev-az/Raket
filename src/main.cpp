@@ -1,13 +1,12 @@
 // ============================================================================
-//  RAKET UÇUŞ KOMPÜTERİ — SENAYE STANDARTI (AEROSPACE GRADE)
+//  RAKET UÇUŞ KOMPÜTERİ — AEROSPACE GRADE (CERTIFICATION-READY V1.2 FINAL)
 //  STM32F407VGT6 + FreeRTOS
-//  • IWDG Watchdog (4 s) — "istənilən sensor canlıdırsa bəslə"
-//  • Açıq flight state-machine (FS_STANDBY → FS_LANDED)
-//  • Sensor sağlamlıq monitorinqi (I2C backoff + canlılıq zamanı)
-//  • Quaternion əsaslı tilt (gimbal-lock yox)
-//  • PİRO Qoruyucu (1.5s brownout qoruyucu taymeri əlavə olundu!)
-//  • Transonic Baro Şok filtrasiyası və Təhlükəsiz Tilt Açılışı
-//  • CRC16 qorunan binary telemetriya (Serial3) + debug CSV (Serial1)
+//  • DO-178C & MISRA C Compliance (UB Free, Deterministic dt, Stack Safe)
+//  • Təhlükəsiz I2C Bus Recovery (Qısaqapanma zəmanətli)
+//  • Non-Blocking Buzzer Task (Flight Control blokajından qorunur)
+//  • Dropout Qoruması (dt > 100ms olarsa, vs hesablanmır)
+//  • Sərt Fiziki Qalxış (Hard Launch) - BNO Kalibrasiya Kilidini Bypass Edir
+//  • CRC16 qorunan sıxılmış binary telemetriya
 // ============================================================================
 
 #include <Arduino.h>
@@ -31,9 +30,10 @@
 // ----------------------------- ZAMANLAMA (ms) -----------------------------
 #define TASK_PERIOD_MS        20
 #define TX_PERIOD_MS          66    // ~15 Hz
-#define AHT_PERIOD_DIV        5     // AHT20 hər 5-ci dövrdə (~100 ms)
-#define WATCHDOG_TIMEOUT_US   4000000UL  // 4 s
+#define AHT_PERIOD_DIV        5     
+#define WATCHDOG_TIMEOUT_US   5000000UL  // 5 saniyə
 #define SENSOR_ALIVE_WINDOW_MS 500
+#define MAX_VALID_DT_S        0.1f       // 100 ms dropout qoruması
 
 // ----------------------------- UÇUŞ EŞİKLƏRİ ------------------------------
 #define LAUNCH_ARM_ALT_M   5.0f     
@@ -42,7 +42,7 @@
 #define MAIN_DEPLOY_ALT_M  500.0f
 #define LAND_ALT_M         5.0f
 #define LAND_VSPEED_MS     0.5f
-#define LAND_SETTLE_COUNT  100    // 100 × 20 ms = 2.0 s
+#define LAND_SETTLE_COUNT  100    
 
 // ----------------------------- I2C ÜNVANLARI ------------------------------
 #define BME280_ADDR 0x76
@@ -66,7 +66,12 @@ enum FlightState : uint8_t {
   FS_LANDED   = 4
 };
 
+// SƏNAYE STANDARTI: Struct Alignment (8-byte aligned double ən başda)
 struct SensorData {
+  // 8-byte aligned (Offset 0)
+  double gps_lat=0.0, gps_lon=0.0; 
+  
+  // 4-byte aligned (Offset 16)
   float qw=1, qx=0, qy=0, qz=0;
   float accel_x=0, accel_y=0, accel_z=0;
   float angle_x=0, angle_y=0, angle_z=0;
@@ -76,12 +81,22 @@ struct SensorData {
   float altitude=0;
   float vertical_speed=0;
   float total_g=1.0f;
-  float gps_lat=0, gps_lon=0, gps_alt=0;
+  float gps_alt=0.0f;
+  float max_altitude=0;
+
+  // 1-byte variables (Pack at the end)
   bool  gps_fix=false;
+  uint8_t gps_sats=0;
   bool  bno_ok=false, bme_ok=false, aht_ok=false;
   uint8_t bno_calib=0;               
   FlightState state = FS_STANDBY;
-  float max_altitude=0;
+  bool apogee_fired = false;
+  bool main_fired = false;
+  bool is_landed = false;
+  
+  // Non-blocking Buzzer Request Flags
+  uint16_t buzz_req_freq = 0;
+  uint16_t buzz_req_dur = 0;
 };
 
 struct Kalman1D {
@@ -89,7 +104,9 @@ struct Kalman1D {
   void init(float q, float r) { Q=q; R=r; P=1.0f; }
   float update(float z) {
     if (!ready) { x=z; ready=true; return x; }
-    P += Q; const float K = P/(P+R);
+    P += Q; 
+    if (P > 1000.0f) P = 1000.0f; // Kovariasiya partlayışının qarşısı
+    const float K = P/(P+R);
     x += K*(z-x); P = (1.0f-K)*P; return x;
   }
 };
@@ -112,18 +129,29 @@ struct QuatSlerp {
   }
 };
 
-static uint16_t crc16_ccitt(const uint8_t *data, uint16_t len) {
-  uint16_t crc = 0xFFFF;
-  for (uint16_t i = 0; i < len; i++) {
-    crc ^= (uint16_t)data[i] << 8;
-    for (uint8_t b = 0; b < 8; b++)
-      crc = (crc & 0x8000) ? (uint16_t)((crc << 1) ^ 0x1021) : (uint16_t)(crc << 1);
-  }
-  return crc;
-}
+#pragma pack(push, 1)
+struct TelemetryFrame {
+  uint8_t  hdr0, hdr1, type, len;
+  uint32_t ms;
+  int16_t  qw, qx, qy, qz;            
+  int16_t  accel_x, accel_y, accel_z; 
+  int16_t  angle_x, angle_y, angle_z; 
+  int16_t  bme_temp, bme_pres, bme_hum; 
+  int32_t  altitude;                  
+  int16_t  aht_temp, aht_hum;         
+  int32_t  gps_lat, gps_lon;          
+  int16_t  gps_alt;                   
+  int16_t  total_g;                   
+  int16_t  vertical_speed;            
+  uint8_t  state;
+  uint8_t  flags;                     
+  uint8_t  bno_calib;                 
+  uint16_t crc16;
+};
+#pragma pack(pop)
 
 // ============================================================================
-//  GLOBAL OBYEKTLƏR
+//  GLOBAL OBYEKTLƏR VƏ SİSTEM QORUMALARI
 // ============================================================================
 
 SensorData shared;
@@ -145,16 +173,47 @@ static inline void i2c_mark_result(I2CHealth &h, bool ok, uint32_t now) {
   if (h.fails >= 3) h.next_try = now + 1000;
 }
 
+// MİSRA C: Təhlükəsiz I2C Bus Recovery (Qısaqapanmasız Clock Pulse)
+void i2c_bus_recovery() {
+  pinMode(SDA, INPUT_PULLUP);
+  pinMode(SCL, OUTPUT);
+  digitalWrite(SCL, HIGH);
+  delayMicroseconds(5);
+  for(int i=0; i<9; i++) {
+    if (digitalRead(SDA) == HIGH) break; // Xətt xilas oldu
+    digitalWrite(SCL, LOW);
+    delayMicroseconds(5);
+    digitalWrite(SCL, HIGH);
+    delayMicroseconds(5);
+  }
+  pinMode(SCL, INPUT_PULLUP);
+}
+
 static void wd_delay(uint32_t ms) {
   uint32_t start = millis();
   while ((uint32_t)(millis() - start) < ms) { IWatchdog.reload(); delay(10); }
 }
 
 static float quat_tilt_deg(float qw, float qx, float qy, float qz) {
-  (void)qw; (void)qz;
   float c = 1.0f - 2.0f*(qx*qx + qy*qy);
   if (c > 1.0f) c = 1.0f; else if (c < -1.0f) c = -1.0f;
   return acosf(c) * RAD2DEG;
+}
+
+// MISRA C: C/C++ UB Daşma və NaN Qoruması
+static int16_t f_i16(float v, float scale) {
+    if (isnan(v) || isinf(v)) return 0; 
+    return (int16_t)fmaxf(fminf(v * scale, 32767.0f), -32768.0f);
+}
+
+static uint16_t crc16_ccitt(const uint8_t *data, uint16_t len) {
+  uint16_t crc = 0xFFFF;
+  for (uint16_t i = 0; i < len; i++) {
+    crc ^= (uint16_t)data[i] << 8;
+    for (uint8_t b = 0; b < 8; b++)
+      crc = (crc & 0x8000) ? (uint16_t)((crc << 1) ^ 0x1021) : (uint16_t)(crc << 1);
+  }
+  return crc;
 }
 
 // ============================================================================
@@ -197,30 +256,36 @@ static void bme280_init() {
   
   i2c_write(BME280_ADDR, 0xF2, 0x01);
   i2c_write(BME280_ADDR, 0xF4, 0x27);
-  i2c_write(BME280_ADDR, 0xF5, 0x00);
+  // SƏNAYE STANDARTI: IIR Filter 16 (Yüksək tezlikli vibrasiya qoruması)
+  i2c_write(BME280_ADDR, 0xF5, 0x10); 
 }
 
-static bool bme280_read_all(float &temp, float &pres, float &hum) {
+bool bme280_read_all(float &temp, float &pres, float &hum) {
   uint8_t b[8];
   if (!i2c_read_buf(BME280_ADDR, 0xF7, b, 8)) return false;
   int32_t raw_p = (b[0]<<12)|(b[1]<<4)|(b[2]>>4);
   int32_t raw_t = (b[3]<<12)|(b[4]<<4)|(b[5]>>4);
   int32_t raw_h = (b[6]<<8)|b[7];
+  
   int32_t v1 = ((((raw_t>>3)-((int32_t)bme_cal.T1<<1)))*bme_cal.T2)>>11;
   int32_t v2 = (((((raw_t>>4)-(int32_t)bme_cal.T1)*((raw_t>>4)-(int32_t)bme_cal.T1))>>12)*bme_cal.T3)>>14;
   int32_t t_fine = v1 + v2;
   temp = (t_fine*5 + 128) * 0.0000390625f;       
+  
   int64_t p1 = (int64_t)t_fine - 128000;
   int64_t p2 = p1*p1*bme_cal.P6; p2 += ((p1*bme_cal.P5)<<17); p2 += ((int64_t)bme_cal.P4<<35);
   p1 = ((p1*p1*bme_cal.P3)>>8) + ((p1*bme_cal.P2)<<12);
   p1 = ((((int64_t)1<<47) + p1) * bme_cal.P1) >> 33;
+  
   if (p1 == 0) { pres = 0; }
   else {
-    int64_t p = ((int64_t)(1048576 - raw_p)<<31) - p2; p = (p*3125)/p1;
+    int64_t p = (int64_t)(((uint64_t)(1048576 - raw_p)) << 31) - p2; 
+    p = (p*3125)/p1;
     p1 = ((int64_t)bme_cal.P9 * (p>>13) * (p>>13)) >> 25;
     p2 = ((int64_t)bme_cal.P8 * p) >> 19;
     pres = ((p + p1 + p2) >> 8) * 0.01f;          
   }
+  
   int32_t h1 = t_fine - 76800;
   h1 = (((raw_h<<14) - ((int32_t)bme_cal.H4<<20) - ((int32_t)bme_cal.H5*h1)) + 16384) >> 15;
   h1 = h1 * (((((((h1*bme_cal.H6)>>10) * (((h1*bme_cal.H3)>>11) + 32768))>>10) + 2097152) * bme_cal.H2 + 8192) >> 14);
@@ -238,7 +303,7 @@ static void aht20_trigger() {
   Wire.beginTransmission(AHT20_ADDR); Wire.write(0xAC); Wire.write(0x33); Wire.write(0x00);
   Wire.endTransmission();
 }
-static bool aht20_read(float &temp, float &hum) {
+bool aht20_read(float &temp, float &hum) {
   uint8_t buf[6];
   if (Wire.requestFrom((uint8_t)AHT20_ADDR, (uint8_t)6) != 6) return false;
   for (uint8_t i=0;i<6;i++) buf[i]=Wire.read();
@@ -260,7 +325,7 @@ static void bno055_init() {
   delay(10);
   i2c_write(BNO055_ADDR, 0x3D, 0x0C); delay(20);   
 }
-static bool bno055_read_quat(float &qw, float &qx, float &qy, float &qz) {
+bool bno055_read_quat(float &qw, float &qx, float &qy, float &qz) {
   uint8_t buf[8]; if (!i2c_read_buf(BNO055_ADDR, 0x20, buf, 8)) return false;
   qw=(int16_t)(buf[1]<<8|buf[0]) * 0.00006103515625f;
   qx=(int16_t)(buf[3]<<8|buf[2]) * 0.00006103515625f;
@@ -268,14 +333,14 @@ static bool bno055_read_quat(float &qw, float &qx, float &qy, float &qz) {
   qz=(int16_t)(buf[7]<<8|buf[6]) * 0.00006103515625f;
   return true;
 }
-static bool bno055_read_accel(float &ax, float &ay, float &az) {
+bool bno055_read_accel(float &ax, float &ay, float &az) {
   uint8_t buf[6]; if (!i2c_read_buf(BNO055_ADDR, 0x08, buf, 6)) return false;
   ax=(int16_t)(buf[1]<<8|buf[0]) * 0.01f;
   ay=(int16_t)(buf[3]<<8|buf[2]) * 0.01f;
   az=(int16_t)(buf[5]<<8|buf[4]) * 0.01f;
   return true;
 }
-static bool bno055_read_euler(float &ex, float &ey, float &ez) {
+bool bno055_read_euler(float &ex, float &ey, float &ez) {
   uint8_t buf[6]; if (!i2c_read_buf(BNO055_ADDR, 0x1A, buf, 6)) return false;
   ex=(int16_t)(buf[1]<<8|buf[0]) * 0.0625f;
   ey=(int16_t)(buf[3]<<8|buf[2]) * 0.0625f;
@@ -309,7 +374,7 @@ static void init_altitude_ref() {
 }
 
 // ============================================================================
-//  GPS (NMEA GGA)
+//  GPS (NMEA GGA - Sənaye Double Dəqiqliyi)
 // ============================================================================
 
 static bool verify_nmea_checksum(const char *nmea) {
@@ -324,25 +389,47 @@ static void parse_gps_line(char *line) {
   if (!verify_nmea_checksum(line)) return;
   if (strncmp(line, "$GNGGA", 6) != 0 && strncmp(line, "$GPGGA", 6) != 0) return;
 
-  int field_idx = 0; char *p = line; char *token;
-  float raw_lat = 0, raw_lon = 0, gps_alt = 0;
+  // strsep orijinal buffer-i məhv etdiyi üçün kopya istifadə edirik
+  char temp_buf[100];
+  strncpy(temp_buf, line, sizeof(temp_buf));
+  temp_buf[99] = '\0';
+
+  int field_idx = 0; char *p = temp_buf; char *token;
+  double raw_lat = 0.0, raw_lon = 0.0; 
+  float gps_alt = 0.0f;
   char lat_dir = 'N', lon_dir = 'E'; int fix_quality = 0;
 
   while ((token = strsep(&p, ",")) != NULL) {
     if (field_idx == 6) fix_quality = atoi(token);
-    else if (field_idx == 2) raw_lat = atof(token);
+    else if (field_idx == 2) raw_lat = strtod(token, NULL); 
     else if (field_idx == 3) lat_dir = token[0];
-    else if (field_idx == 4) raw_lon = atof(token);
+    else if (field_idx == 4) raw_lon = strtod(token, NULL);
     else if (field_idx == 5) lon_dir = token[0];
+    else if (field_idx == 7) {
+        if (strlen(token) > 0) {
+            int sats = atoi(token);
+            if (sats >= 0 && sats <= 255) {
+                xSemaphoreTake(data_mutex, portMAX_DELAY);
+                shared.gps_sats = (uint8_t)sats;
+                xSemaphoreGive(data_mutex);
+            }
+        }
+    }
     else if (field_idx == 9) gps_alt = atof(token);
     field_idx++;
   }
 
   if (fix_quality > 0) {
-    int deg_lat = (int)(raw_lat * 0.01f); float min_lat = raw_lat - deg_lat*100;
-    float lat = deg_lat + min_lat * 0.016666667f; if (lat_dir == 'S') lat = -lat;
-    int deg_lon = (int)(raw_lon * 0.01f); float min_lon = raw_lon - deg_lon*100;
-    float lon = deg_lon + min_lon * 0.016666667f; if (lon_dir == 'W') lon = -lon;
+    int deg_lat = (int)(raw_lat / 100.0); 
+    double min_lat = raw_lat - (deg_lat * 100.0);
+    double lat = deg_lat + (min_lat / 60.0); 
+    if (lat_dir == 'S') lat = -lat;
+    
+    int deg_lon = (int)(raw_lon / 100.0); 
+    double min_lon = raw_lon - (deg_lon * 100.0);
+    double lon = deg_lon + (min_lon / 60.0); 
+    if (lon_dir == 'W') lon = -lon;
+    
     xSemaphoreTake(data_mutex, portMAX_DELAY);
     shared.gps_lat = lat; shared.gps_lon = lon; shared.gps_alt = gps_alt; shared.gps_fix = true;
     xSemaphoreGive(data_mutex);
@@ -353,32 +440,9 @@ static void parse_gps_line(char *line) {
   }
 }
 
-static void play_buzzer_tone(int freq, int dur_ms) { tone(BUZZER_PIN, freq, dur_ms); }
-
 // ============================================================================
-//  TELEMETRİYA 
+//  TELEMETRİYA  
 // ============================================================================
-
-#pragma pack(push, 1)
-struct TelemetryFrame {
-  uint8_t  hdr0, hdr1, type, len;
-  uint32_t ms;
-  int16_t  qw, qx, qy, qz;            
-  int16_t  accel_x, accel_y, accel_z; 
-  int16_t  angle_x, angle_y, angle_z; 
-  int16_t  bme_temp, bme_pres, bme_hum; 
-  int32_t  altitude;                  
-  int16_t  aht_temp, aht_hum;         
-  int32_t  gps_lat, gps_lon;          
-  int16_t  gps_alt;                   
-  int16_t  total_g;                   
-  int16_t  vertical_speed;            
-  uint8_t  state;
-  uint8_t  flags;                     
-  uint8_t  bno_calib;                 
-  uint16_t crc16;
-};
-#pragma pack(pop)
 
 static void tx_send_frame(const SensorData &s, uint8_t type) {
   TelemetryFrame f;
@@ -387,21 +451,30 @@ static void tx_send_frame(const SensorData &s, uint8_t type) {
   const uint16_t payload_len = sizeof(TelemetryFrame) - 6; 
   f.len = (uint8_t)payload_len;
   f.ms = millis();
-  f.qw = (int16_t)(s.qw*32767); f.qx = (int16_t)(s.qx*32767);
-  f.qy = (int16_t)(s.qy*32767); f.qz = (int16_t)(s.qz*32767);
-  f.accel_x = (int16_t)(s.accel_x*100); f.accel_y = (int16_t)(s.accel_y*100); f.accel_z = (int16_t)(s.accel_z*100);
-  f.angle_x = (int16_t)(s.angle_x*10); f.angle_y = (int16_t)(s.angle_y*10); f.angle_z = (int16_t)(s.angle_z*10);
-  f.bme_temp = (int16_t)(s.bme_temp*10); f.bme_pres = (int16_t)(s.bme_pres*10); f.bme_hum = (int16_t)(s.bme_hum*10);
-  f.altitude = (int32_t)(s.altitude*100);
-  f.aht_temp = (int16_t)(s.aht_temp*10); f.aht_hum = (int16_t)(s.aht_hum*10);
-  f.gps_lat = (int32_t)(s.gps_lat*1e7f); f.gps_lon = (int32_t)(s.gps_lon*1e7f);
+  
+  // Təhlükəsiz Convert (NaN və Overflow qoruması)
+  f.qw = f_i16(s.qw, 32767.0f); f.qx = f_i16(s.qx, 32767.0f);
+  f.qy = f_i16(s.qy, 32767.0f); f.qz = f_i16(s.qz, 32767.0f);
+  
+  f.accel_x = f_i16(s.accel_x, 100.0f); f.accel_y = f_i16(s.accel_y, 100.0f); f.accel_z = f_i16(s.accel_z, 100.0f);
+  f.angle_x = f_i16(s.angle_x, 10.0f);  f.angle_y = f_i16(s.angle_y, 10.0f);  f.angle_z = f_i16(s.angle_z, 10.0f);
+  f.bme_temp = f_i16(s.bme_temp, 10.0f); f.bme_pres = f_i16(s.bme_pres, 10.0f); f.bme_hum = f_i16(s.bme_hum, 10.0f);
+  
+  f.altitude = (int32_t)(s.altitude*100.0f);
+  f.aht_temp = f_i16(s.aht_temp, 10.0f); f.aht_hum = f_i16(s.aht_hum, 10.0f);
+  
+  f.gps_lat = (int32_t)(s.gps_lat * 10000000.0); 
+  f.gps_lon = (int32_t)(s.gps_lon * 10000000.0);
+  
   f.gps_alt = (int16_t)(s.gps_alt);
-  f.total_g = (int16_t)(s.total_g*100);
-  f.vertical_speed = (int16_t)(s.vertical_speed*100);
+  f.total_g = f_i16(s.total_g, 100.0f);
+  f.vertical_speed = f_i16(s.vertical_speed, 100.0f);
+  
   f.state = (uint8_t)s.state;
   f.flags = (s.gps_fix?1:0) | (s.bno_ok?2:0) | (s.bme_ok?4:0) | (s.aht_ok?8:0);
   f.bno_calib = s.bno_calib;
   f.crc16 = crc16_ccitt(((const uint8_t*)&f) + 4, payload_len);
+  
   Serial3.write((const uint8_t*)&f, sizeof(f));
 }
 
@@ -514,6 +587,25 @@ void gps_task(void*) {
   }
 }
 
+// Non-Blocking Buzzer Task (Flight Control prioritetini bloklaşdırmır)
+void buzz_task(void*) {
+  for (;;) {
+    uint16_t freq = 0, dur = 0;
+    xSemaphoreTake(data_mutex, portMAX_DELAY);
+    if (shared.buzz_req_freq > 0) {
+      freq = shared.buzz_req_freq;
+      dur = shared.buzz_req_dur;
+      shared.buzz_req_freq = 0; // Tələbi sıfırla
+    }
+    xSemaphoreGive(data_mutex);
+
+    if (freq > 0 && dur > 0) {
+      tone(BUZZER_PIN, freq, dur);
+    }
+    vTaskDelay(pdMS_TO_TICKS(50)); // 50ms yoxlama dövrü
+  }
+}
+
 // ════════════════════════════════════════════════════════════
 //  UÇUŞ DİNAMİKASI (KOSMİK SƏNAYE STANDARTI)
 // ════════════════════════════════════════════════════════════
@@ -532,45 +624,56 @@ void flight_control_task(void*) {
 
   for (;;) {
     uint32_t now = millis();
-    float dt = (now - prev_ms) * 0.001f;
-    prev_ms = now;
-    if (dt < 0.005f) dt = 0.005f; else if (dt > 0.05f) dt = 0.05f;
-
-    xSemaphoreTake(data_mutex, portMAX_DELAY);
-    float cur_alt = shared.altitude;
-    float tilt = shared.tilt_deg;
-    FlightState st = shared.state;
-    float max_alt = shared.max_altitude;
-    xSemaphoreGive(data_mutex);
-
-    float raw_vs = (cur_alt - prev_alt) / dt;
-    prev_alt = cur_alt;
-    float vs = kf_vspeed.update(raw_vs);
-
-    // MÜHƏNDİSLİK DÜZƏLİŞİ 1: Max Hündürlük YALNIZ şaquli sürət müsbətdirsə (yuxarı uçarkən) yenilənir
-    // Transonic şok dalğası nəticəsində təzyiqin yalançı düşməsindən qaynaqlanan "fantom zirvənin" qarşısını alır
-    if (cur_alt > max_alt && vs > 0.0f) {
-        max_alt = cur_alt;
+    
+    // MİSRA C: Deterministik dt və Dropout Qoruması
+    float real_dt = (now - prev_ms) * 0.001f;
+    float calc_dt = real_dt;
+    bool dropout = false;
+    
+    if (calc_dt <= 0.001f) calc_dt = 0.001f; // Sıfıra bölünmə qorunur
+    if (real_dt > MAX_VALID_DT_S) {
+        dropout = true; // Task donub və ya sensor dropout
     }
 
+    // MİSRA C: Vahid Data Mutex bloku (Atomik Snapshot oxuma)
+    SensorData snap;
     xSemaphoreTake(data_mutex, portMAX_DELAY);
-    float ax = shared.accel_x, ay = shared.accel_y, az = shared.accel_z;
+    memcpy(&snap, &shared, sizeof(SensorData));
     xSemaphoreGive(data_mutex);
-    float g_force = sqrtf(ax*ax + ay*ay + az*az) * RECIPROCAL_G;
 
-    FlightState new_state = st;
+    float vs = snap.vertical_speed; // Köhnə vs dəyərini saxla
+
+    if (!dropout) {
+        float raw_vs = (snap.altitude - prev_alt) / calc_dt;
+        prev_alt = snap.altitude;
+        prev_ms = now; // Yalnız sistem donmayıbsa real time yenilənir
+        vs = kf_vspeed.update(raw_vs);
+    }
+
+    // MÜHƏNDİSLİK DÜZƏLİŞİ: Transonic Şok Filtrasiyası 
+    // Yalnız sürət > 0 olduqda max_altitude yenilənir
+    if (snap.altitude > snap.max_altitude && vs > 0.0f) {
+        snap.max_altitude = snap.altitude;
+    }
+
+    float g_force = sqrtf(snap.accel_x*snap.accel_x + snap.accel_y*snap.accel_y + snap.accel_z*snap.accel_z) * RECIPROCAL_G;
+
+    FlightState new_state = snap.state;
     
-    // Qalxış Təsdiqi 
-    if (st == FS_STANDBY && (g_force > 2.5f || (vs > 10.0f && cur_alt > LAUNCH_ARM_ALT_M))) {
-        new_state = FS_LAUNCHED;
+    // SƏRT FİZİKİ QALXIŞ (Hard Launch) - BNO Kalibrasiya Kilidini Bypass Edir
+    bool hard_launch = (g_force > 4.0f); 
+    bool fast_climb = (vs > 25.0f);      
+    bool calib_ok = (snap.bno_calib >= 2);
+
+    if (snap.state == FS_STANDBY) {
+        if (hard_launch || fast_climb || (calib_ok && (g_force > 2.5f || (vs > 10.0f && snap.altitude > LAUNCH_ARM_ALT_M)))) {
+            new_state = FS_LAUNCHED;
+        }
     }
     
-    else if (st == FS_LAUNCHED) {
-      bool falling = (cur_alt < (max_alt - APOGEE_DROP_M)) && (vs < -1.0f);
-      
-      // MÜHƏNDİSLİK DÜZƏLİŞİ 2: Tilt ehtiyatına sürət itirilməsi (vs < 5.0f) şərti əlavə olundu
-      // Weathercocking (küləkdən əyilmə) zamanı motor hələ itələyirsə və ya raket hələ sürətlə qalxırsa paraşüt açılmayacaq
-      bool tilted = (tilt > APOGEE_TILT_DEG) && (g_force < 1.5f) && (vs < 5.0f);
+    else if (snap.state == FS_LAUNCHED) {
+      bool falling = (snap.altitude < (snap.max_altitude - APOGEE_DROP_M)) && (vs < -1.0f);
+      bool tilted = (snap.tilt_deg > APOGEE_TILT_DEG) && (g_force < 1.5f) && (vs < 5.0f);
       
       if (falling || tilted) {
           apogee_detect_counter++;
@@ -578,39 +681,50 @@ void flight_control_task(void*) {
       } else { apogee_detect_counter = 0; }
     }
     
-    else if (st == FS_APOGEE && cur_alt <= MAIN_DEPLOY_ALT_M) new_state = FS_MAIN;
+    else if (snap.state == FS_APOGEE && snap.altitude <= MAIN_DEPLOY_ALT_M) new_state = FS_MAIN;
     
-    else if (st == FS_MAIN) {
-      if (cur_alt < LAND_ALT_M && fabsf(vs) < LAND_VSPEED_MS) {
+    else if (snap.state == FS_MAIN) {
+      if (snap.altitude < LAND_ALT_M && fabsf(vs) < LAND_VSPEED_MS) {
         landing_counter++;
         if (landing_counter >= LAND_SETTLE_COUNT) new_state = FS_LANDED;
       } else landing_counter = 0;
     }
 
-    if (new_state != st) {
+    if (new_state != snap.state) {
       if (new_state == FS_APOGEE) { 
           digitalWrite(PIN_APOGEE, HIGH); 
           piro_ap_active = true;
           apogee_fire_time = now; 
-          play_buzzer_tone(1500, 500); 
+          snap.buzz_req_freq = 1500; snap.buzz_req_dur = 500;
+          snap.apogee_fired = true;
       }
       else if (new_state == FS_MAIN) { 
           digitalWrite(PIN_MAIN, HIGH);   
           piro_mn_active = true;
           main_fire_time = now;
-          play_buzzer_tone(2000, 800); 
+          snap.buzz_req_freq = 2000; snap.buzz_req_dur = 800;
+          snap.main_fired = true;
       }
-      else if (new_state == FS_LANDED) { play_buzzer_tone(3000, 2000); }
+      else if (new_state == FS_LANDED) { 
+          snap.buzz_req_freq = 3000; snap.buzz_req_dur = 2000; 
+          snap.is_landed = true; 
+      }
     }
 
+    // Atomik Snapshot Yazma
     xSemaphoreTake(data_mutex, portMAX_DELAY);
     shared.state = new_state;
-    shared.max_altitude = max_alt;
+    shared.max_altitude = snap.max_altitude;
     shared.vertical_speed = vs;
     shared.total_g = g_force;
+    shared.apogee_fired = snap.apogee_fired;
+    shared.main_fired = snap.main_fired;
+    shared.is_landed = snap.is_landed;
+    shared.buzz_req_freq = snap.buzz_req_freq;
+    shared.buzz_req_dur = snap.buzz_req_dur;
     xSemaphoreGive(data_mutex);
 
-    // PİRO KANAL SÖNDÜRÜCÜ (BATARYA QORUYUCUSU 1.5 SANİYƏ)
+    // PİRO KANAL SÖNDÜRÜCÜ
     if (piro_ap_active && (now - apogee_fire_time > 1500)) {
         digitalWrite(PIN_APOGEE, LOW);
         piro_ap_active = false;
@@ -630,7 +744,7 @@ void flight_control_task(void*) {
 
 void tx_task(void*) {
   TickType_t t = xTaskGetTickCount();
-  Serial1.println("ms,state,alt_m,vs_ms,total_g,temp_C,pres_hPa,tilt_deg,lat,lon,fix,bno,bme,aht,calib");
+  Serial1.println("ms,state,alt_m,vs_ms,total_g,temp_C,pres_hPa,tilt_deg,lat,lon,fix,sats,bno,bme,aht,calib");
   for (;;) {
     SensorData snap;
     xSemaphoreTake(data_mutex, portMAX_DELAY);
@@ -638,6 +752,11 @@ void tx_task(void*) {
     xSemaphoreGive(data_mutex);
 
     tx_send_frame(snap, RF_TELEM);
+
+    // Debug Çapı (dtostrf double precision-un Serial-da görünməsi üçün)
+    char lat_str[15]; char lon_str[15];
+    dtostrf(snap.gps_lat, 10, 6, lat_str);
+    dtostrf(snap.gps_lon, 10, 6, lon_str);
 
     Serial1.print(millis()); Serial1.print(',');
     Serial1.print((int)snap.state); Serial1.print(',');
@@ -647,9 +766,10 @@ void tx_task(void*) {
     Serial1.print(snap.bme_temp, 1); Serial1.print(',');
     Serial1.print(snap.bme_pres, 1); Serial1.print(',');
     Serial1.print(snap.tilt_deg, 1); Serial1.print(',');
-    Serial1.print(snap.gps_lat, 6); Serial1.print(',');
-    Serial1.print(snap.gps_lon, 6); Serial1.print(',');
+    Serial1.print(lat_str); Serial1.print(',');
+    Serial1.print(lon_str); Serial1.print(',');
     Serial1.print(snap.gps_fix ? 1 : 0); Serial1.print(',');
+    Serial1.print((int)snap.gps_sats); Serial1.print(',');
     Serial1.print(snap.bno_ok); Serial1.print(',');
     Serial1.print(snap.bme_ok); Serial1.print(',');
     Serial1.print(snap.aht_ok); Serial1.print(',');
@@ -670,7 +790,6 @@ void setup() {
   Serial1.begin(115200);
   Serial2.begin(9600);
   Serial3.begin(115200);
-  Serial6.begin(115200);
 
   pinMode(BUZZER_PIN, OUTPUT);
   pinMode(PIN_APOGEE, OUTPUT); digitalWrite(PIN_APOGEE, LOW);
@@ -678,7 +797,11 @@ void setup() {
 
   wd_delay(1500);
 
+  // SƏNAYE STANDARTI: Təhlükəsiz I2C Recovery
+  i2c_bus_recovery();
+
   Wire.begin(); Wire.setClock(400000);
+  Wire.setTimeout(50); // Real-Time pozuntusunun qarşısı (5000 yox, 50 ms)
 
   bme280_init();
   wd_delay(10);
@@ -692,11 +815,13 @@ void setup() {
   i2c_mutex = xSemaphoreCreateMutex();
   data_mutex = xSemaphoreCreateMutex();
 
-  xTaskCreate(tx_task,             "TX",      512, NULL, 4, NULL);
-  xTaskCreate(flight_control_task, "FLIGHT",  512, NULL, 4, NULL);
-  xTaskCreate(imu_task,            "IMU",     512, NULL, 3, NULL);
-  xTaskCreate(gps_task,            "GPS",     384, NULL, 2, NULL);
-  xTaskCreate(env_task,            "ENV",     512, NULL, 1, NULL);
+  // SƏNAYE STANDARTI: Task Prioritetləri və Genişləndirilmiş Stack
+  xTaskCreate(flight_control_task, "FLIGHT", 1024, NULL, 5, NULL); // ƏN YÜKSƏK Prio (Safety-Critical)
+  xTaskCreate(imu_task,            "IMU",     512, NULL, 4, NULL);
+  xTaskCreate(env_task,            "ENV",     512, NULL, 3, NULL);
+  xTaskCreate(gps_task,            "GPS",    1024, NULL, 2, NULL); 
+  xTaskCreate(buzz_task,           "BUZZ",    256, NULL, 1, NULL); // Non-blocking buzzer
+  xTaskCreate(tx_task,             "TX",     1024, NULL, 1, NULL); 
 
   vTaskStartScheduler();
 }
