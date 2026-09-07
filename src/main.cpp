@@ -3,18 +3,27 @@
 #include <math.h>
 #include <STM32FreeRTOS.h>
 #include <string.h>
+#include <IWatchdog.h> // STM32 Hardware Watchdog
 
-HardwareSerial Serial1(PA10, PA9);    
-HardwareSerial Serial2(PA3, PA2);     // GPS  
-HardwareSerial Serial3(PB11, PB10);   // RF Telemetriya (Binary)
-HardwareSerial Serial6(PC7, PC6);     
+// Serial1/2/3/6 instansları platformio.ini-dəki -DENABLE_HWSERIALx bayraqları ilə
+// core tərəfindən rəsmi olaraq yaradılır; burada əl ilə tərif YOXDUR.
+
+// Watchdog-u bəsləyərək bloklanan gecikmə.
+// setup()-ın uzun gecikmələrində (2 saniyəlik) watchdog reset-inin qarşısını alır.
+static void wd_delay(uint32_t ms) {
+  uint32_t start = millis();
+  while ((uint32_t)(millis() - start) < ms) {
+    IWatchdog.reload();
+    delay(10);
+  }
+}
 
 #define BUZZER_PIN PE9
 #define PIN_APOGEE PD12    
 #define PIN_MAIN   PD13    
 
-#define RECIPROCAL_G 0.1019368f       // 1.0f / 9.81f
-#define RAD2DEG 57.295779513f         // Radian to Degree constant
+#define RECIPROCAL_G 0.1019368f       
+#define RAD2DEG 57.295779513f         
 #define GRAVITY 9.80665f
 
 // --- UÇUŞ MƏRHƏLƏLƏRİ (STATE MACHINE) ---
@@ -32,6 +41,7 @@ struct SensorData {
   float bme_temp=0, bme_hum=0, bme_pres=0;
   float aht_temp=0, aht_hum=0;
   float altitude=0;
+  float max_altitude=0; // Race condition sığortası
   float gps_lat=0.0f, gps_lon=0.0f, gps_alt=0.0f;
   bool  gps_fix=false;
   uint8_t gps_sats=0;
@@ -61,10 +71,16 @@ struct Kalman1D {
 SensorData shared;
 SemaphoreHandle_t i2c_mutex, data_mutex;
 Kalman1D kf_bme_temp, kf_bme_hum, kf_bme_pres, kf_aht_temp, kf_aht_hum, kf_altitude, kf_vspeed;
-volatile float max_flight_alt = 0.0f;
+
+// CANLILIQ TAYMERİ (Watchdog qoruyucusu üçün)
+volatile uint32_t last_sensor_time = 0; 
 
 // ======================== I2C DRIVERS ========================
-bool i2c_write(uint8_t addr, uint8_t reg, uint8_t data) { Wire.beginTransmission(addr); Wire.write(reg); Wire.write(data); return Wire.endTransmission() == 0; }
+bool i2c_write(uint8_t addr, uint8_t reg, uint8_t data) { 
+  Wire.beginTransmission(addr); Wire.write(reg); Wire.write(data); 
+  return Wire.endTransmission() == 0; 
+}
+
 bool i2c_read_buf(uint8_t addr, uint8_t reg, uint8_t *buf, uint8_t len) {
   Wire.beginTransmission(addr); Wire.write(reg);
   if (Wire.endTransmission(false) != 0) return false;
@@ -88,8 +104,14 @@ struct { uint16_t T1; int16_t T2, T3; uint16_t P1; int16_t P2,P3,P4,P5,P6,P7,P8,
 
 void bme280_init() { 
   uint8_t buf[26]; i2c_read_buf(BME280_ADDR, 0x88, buf, 26);
-  bme_cal.T1=buf[1]<<8|buf[0]; bme_cal.T2=buf[3]<<8|buf[2]; bme_cal.T3=buf[5]<<8|buf[4]; bme_cal.P1=buf[7]<<8|buf[6]; bme_cal.P2=buf[9]<<8|buf[8]; bme_cal.P3=buf[11]<<8|buf[10]; bme_cal.P4=buf[13]<<8|buf[12]; bme_cal.P5=buf[15]<<8|buf[14]; bme_cal.P6=buf[17]<<8|buf[16]; bme_cal.P7=buf[19]<<8|buf[18]; bme_cal.P8=buf[21]<<8|buf[20]; bme_cal.P9=buf[23]<<8|buf[22]; bme_cal.H1=buf[25]; uint8_t hb[7]; i2c_read_buf(BME280_ADDR,0xE1,hb,7);
-  bme_cal.H2=hb[1]<<8|hb[0]; bme_cal.H3=hb[2]; bme_cal.H4=(int16_t)(hb[3]<<4)|(hb[4]&0x0F); bme_cal.H5=(int16_t)(hb[5]<<4)|(hb[4]>>4); bme_cal.H6=(int8_t)hb[6];
+  bme_cal.T1=buf[1]<<8|buf[0]; bme_cal.T2=buf[3]<<8|buf[2]; bme_cal.T3=buf[5]<<8|buf[4]; 
+  bme_cal.P1=buf[7]<<8|buf[6]; bme_cal.P2=buf[9]<<8|buf[8]; bme_cal.P3=buf[11]<<8|buf[10]; 
+  bme_cal.P4=buf[13]<<8|buf[12]; bme_cal.P5=buf[15]<<8|buf[14]; bme_cal.P6=buf[17]<<8|buf[16]; 
+  bme_cal.P7=buf[19]<<8|buf[18]; bme_cal.P8=buf[21]<<8|buf[20]; bme_cal.P9=buf[23]<<8|buf[22]; 
+  bme_cal.H1=buf[25]; 
+  uint8_t hb[7]; i2c_read_buf(BME280_ADDR,0xE1,hb,7);
+  bme_cal.H2=hb[1]<<8|hb[0]; bme_cal.H3=hb[2]; bme_cal.H4=(int16_t)(hb[3]<<4)|(hb[4]&0x0F); 
+  bme_cal.H5=(int16_t)(hb[5]<<4)|(hb[4]>>4); bme_cal.H6=(int8_t)hb[6];
   i2c_write(BME280_ADDR,0xF2,0x01); i2c_write(BME280_ADDR,0xF4,0x27); i2c_write(BME280_ADDR,0xF5,0xA0);
 }
 
@@ -146,9 +168,10 @@ bool bno055_read_euler(float &ex, float &ey, float &ez) {
 // ======================== GPS & ALTITUDE ========================
 static float p_ref = 1013.25f;
 float calc_altitude(float pres_hPa) { return 44330.0f * (1.0f - powf(pres_hPa / p_ref, 0.190284f)); }
+
 void init_altitude_ref() {
   float sum = 0; int good = 0; const int N = 30;
-  for (int i = 0; i < N; i++) { float t, p, h; if (bme280_read_all(t, p, h)) { sum += p; good++; } delay(50); }
+  for (int i = 0; i < N; i++) { float t, p, h; if (bme280_read_all(t, p, h)) { sum += p; good++; } wd_delay(50); }
   p_ref = good > 0 ? sum / good : p_ref;
 }
 
@@ -162,11 +185,14 @@ bool verify_nmea_checksum(const char* nmea) {
 void parse_gps_line(char *line) {
   if (!verify_nmea_checksum(line)) return; 
   if (strncmp(line, "$GNGGA", 6) == 0 || strncmp(line, "$GPGGA", 6) == 0) {
-    int field_idx = 0; char *p = line; char *token;
-    float raw_lat = 0, raw_lon = 0, gps_alt = 0; char lat_dir = 'N', lon_dir = 'E'; 
+    int field_idx = 0; char *saveptr;
+    char *token = strtok_r(line, ",", &saveptr); 
+    
+    float raw_lat = 0, raw_lon = 0, gps_alt = 0; 
+    char lat_dir = 'N', lon_dir = 'E'; 
     int fix_quality = 0, sats = 0;
     
-    while ((token = strsep(&p, ",")) != NULL) {
+    while (token != NULL) {
       if (field_idx == 6) fix_quality = atoi(token); 
       else if (field_idx == 7) sats = atoi(token); 
       else if (field_idx == 2) raw_lat = atof(token); 
@@ -175,6 +201,7 @@ void parse_gps_line(char *line) {
       else if (field_idx == 5) lon_dir = token[0]; 
       else if (field_idx == 9) gps_alt = atof(token); 
       field_idx++;
+      token = strtok_r(NULL, ",", &saveptr);
     }
     
     xSemaphoreTake(data_mutex, portMAX_DELAY);
@@ -255,16 +282,13 @@ void tx_task(void*) {
     memcpy(&snap, &shared, sizeof(SensorData)); 
     xSemaphoreGive(data_mutex);
 
-    // --- EVENT DRIVEN STATUS ---
-    // Qalxış/Eniş Anında (Event) Yerə Dərhal Məlumat Göndər (Kompakt: 2 Bayt)
     if (snap.state != prev_tx_state) {
         uint8_t p[2] = {1, (uint8_t)snap.state}; 
         rf_write_packet(RF_PKT_STATUS, p, 2);
         prev_tx_state = snap.state;
-        vTaskDelay(pdMS_TO_TICKS(5)); // Toqquşmanı önləmək üçün mini gözləmə
+        vTaskDelay(pdMS_TO_TICKS(10));
     }
 
-    // --- BİNARY TELEMETRİYA PAKETİ (Saniyədə 15 dəfə) ---
     uint8_t p[96]; size_t i = 0;
     uint16_t flags = 0;
     
@@ -272,42 +296,33 @@ void tx_task(void*) {
     if (snap.bme_ok) flags |= 0x0002;
     if (snap.aht_ok) flags |= 0x0004;
     if (snap.gps_fix) flags |= 0x0008;
-    flags |= 0x0010; // ARMED her zaman True (Raket)
+    flags |= 0x0010; // ARMED=True
     if (snap.apogee_fired) flags |= 0x0020;
     if (snap.main_fired) flags |= 0x0040;
     if (snap.is_landed) flags |= 0x0080;
 
     put_u16(p, i, flags);
-
-    // BNO055
     put_i16(p, i, f_i16(snap.accel_x, 100.0f)); 
     put_i16(p, i, f_i16(snap.accel_y, 100.0f)); 
     put_i16(p, i, f_i16(snap.accel_z, 100.0f));
     put_i16(p, i, f_i16(snap.angle_x, 100.0f)); 
     put_i16(p, i, f_i16(snap.angle_y, 100.0f)); 
     put_i16(p, i, f_i16(snap.angle_z, 100.0f));
-    
-    // BME280 / AHT20
     put_i16(p, i, f_i16(snap.bme_temp, 100.0f));
     put_u16(p, i, f_u16(snap.bme_pres, 10.0f));
     put_i32(p, i, f_i32(snap.altitude, 100.0f)); 
     put_i16(p, i, f_i16(snap.aht_temp, 100.0f));
     put_u16(p, i, f_u16(snap.aht_hum, 100.0f));
-
-    // GPS
     put_i32(p, i, (int32_t)(snap.gps_lat * 10000000.0));
     put_i32(p, i, (int32_t)(snap.gps_lon * 10000000.0));
     put_i32(p, i, f_i32(snap.gps_alt, 100.0f));
     put_u8(p, i, snap.gps_sats);
-
-    // Uçuş Dinamikası
     put_i16(p, i, f_i16(snap.vertical_speed, 100.0f));
     put_u16(p, i, f_u16(snap.total_g, 1000.0f));
     put_u8(p, i, (uint8_t)snap.state);
 
     rf_write_packet(RF_PKT_TELEM, p, i);
-
-    vTaskDelayUntil(&t, pdMS_TO_TICKS(66)); // ~15 Hz Telemetriya
+    vTaskDelayUntil(&t, pdMS_TO_TICKS(66)); // 15 Hz
   }
 }
 
@@ -320,12 +335,16 @@ void flight_control_task(void*) {
   static uint32_t prev_time_ms = 0;
   static uint32_t landing_counter = 0;
   static uint32_t launch_detect_counter = 0; 
-
-  // Piro Batareya qoruyucuları (Brownout sığortası)
   static uint32_t apogee_fire_time = 0;
   static uint32_t main_fire_time = 0;
+  static float prev_landing_alt = 0.0f; 
 
   for (;;) {
+    // SƏRT QORUYUCU: Sensorlar sağdırsa Watchdog-u bəslə!
+    if (millis() - last_sensor_time < 500) {
+        IWatchdog.reload(); 
+    }
+
     uint32_t now_ms = millis();
     
     xSemaphoreTake(data_mutex, portMAX_DELAY);
@@ -336,26 +355,27 @@ void flight_control_task(void*) {
     bool mn_fired = shared.main_fired;
     bool is_landed = shared.is_landed;
     FlightState current_state = shared.state;
+    
+    if (cur_alt > shared.max_altitude) {
+        shared.max_altitude = cur_alt;
+    }
+    float max_alt = shared.max_altitude;
     xSemaphoreGive(data_mutex);
-
-    if (cur_alt > max_flight_alt) max_flight_alt = cur_alt;
 
     // --- 1. DİNAMİK dt İLƏ SÜRƏT VƏ BARO-İNERTİAL FÜZYON ---
     float dt = (now_ms - prev_time_ms) / 1000.0f;
     float v_speed = 0.0f;
     
-    // Quaternion Matrix R33 - Gövdə Z oxunun Dünya Şaquli oxuna proyeksiyası (İşarələr Dəqiqdir!)
     float gz_vector = qw*qw - qx*qx - qy*qy + qz*qz; 
     float a_world_z = 2.0f*(qx*qz - qw*qy)*ax + 2.0f*(qw*qx + qy*qz)*ay + gz_vector*az;
-    float a_vert = a_world_z - GRAVITY; // Xalis şaquli təcil
+    float a_vert = a_world_z - GRAVITY; 
 
     xSemaphoreTake(data_mutex, portMAX_DELAY);
     v_speed = shared.vertical_speed; 
     if (dt > 0.001f && dt < 0.1f) { 
-      // Komplementar Filtr: İnertial sürət hərəkəti anında sezir, Baro drifti düzəldir
       float baro_vspeed = (cur_alt - prev_alt) / dt;
       float inertial_vspeed = v_speed + (a_vert * dt);
-      v_speed = (inertial_vspeed * 0.95f) + (baro_vspeed * 0.05f); // 95% İnersiya, 5% Barometr
+      v_speed = (inertial_vspeed * 0.95f) + (baro_vspeed * 0.05f); 
     }
     shared.vertical_speed = v_speed;
     xSemaphoreGive(data_mutex);
@@ -363,34 +383,42 @@ void flight_control_task(void*) {
     prev_alt = cur_alt;
     prev_time_ms = now_ms;
 
-    // --- 2. G QÜVVƏSİ HESABLAMASI ---
+    // --- 2. G QÜVVƏSİ VƏ TILT ---
     float accel_magnitude_sq = ax * ax + ay * ay + az * az;
     float g_force = sqrtf(accel_magnitude_sq) * RECIPROCAL_G;
 
     xSemaphoreTake(data_mutex, portMAX_DELAY); shared.total_g = g_force; xSemaphoreGive(data_mutex);
-
-    // --- 3. QUATERNION TILT (Gimbal Lock Sığortası) ---
     float tilt_angle = acosf(fmaxf(fminf(gz_vector, 1.0f), -1.0f)) * RAD2DEG;
 
-    // --- 4. QALXIŞ DETEKSİYASI (Launch) ---
+    // --- 3. QALXIŞ DETEKSİYASI (Sərtləşdirilmiş: Həm Təcil Həm Sürət) ---
     if (current_state == FS_STANDBY) {
-        // Təsadüfi zərbələri süzür: Ardıcıl təcil və >10m qalxış
-        if ((cur_alt > 10.0f && v_speed > 10.0f) || g_force > 2.5f) {
+        if ((g_force > 2.5f) && (v_speed > 5.0f)) { 
             launch_detect_counter++;
-            if (launch_detect_counter > 5) current_state = FS_LAUNCHED; // Ən az 100ms davamlı
-        } else { launch_detect_counter = 0; }
+            if (launch_detect_counter > 5) { 
+                xSemaphoreTake(data_mutex, portMAX_DELAY); 
+                shared.state = FS_LAUNCHED; 
+                xSemaphoreGive(data_mutex);
+                current_state = FS_LAUNCHED;
+                play_buzzer_tone(1000, 200);
+            }
+        } else { 
+            launch_detect_counter = 0; 
+        }
     }
 
-    // --- 5. TƏHLÜKƏSİZLİK VƏ PİRO ATƏŞLƏMƏ ---
-    if (max_flight_alt > 50.0f && current_state != FS_STANDBY) {  
+    // --- 4. TƏHLÜKƏSİZLİK VƏ PİRO ATƏŞLƏMƏ ---
+    if (max_alt > 50.0f && current_state != FS_STANDBY) {  
       
-      // -- Apogee Paraşütü (Drogue) --
+      // Apogee Paraşütü (Drogue)
       if (!ap_fired) {
-        bool is_falling = (cur_alt < (max_flight_alt - 3.0f)) && (v_speed < -1.0f);
-        bool is_tilted = (tilt_angle > 70.0f) && (g_force < 1.5f); // Motor hələ yanarkən açılmasın!
+        bool is_falling = (cur_alt < (max_alt - 3.0f)) && (v_speed < -1.0f);
+        bool is_tilted = (tilt_angle > 70.0f) && (g_force < 1.5f); 
 
         if (is_falling || is_tilted) {
-          xSemaphoreTake(data_mutex, portMAX_DELAY); shared.apogee_fired = true; xSemaphoreGive(data_mutex);
+          xSemaphoreTake(data_mutex, portMAX_DELAY); 
+          shared.apogee_fired = true; 
+          shared.state = FS_APOGEE;
+          xSemaphoreGive(data_mutex);
           current_state = FS_APOGEE;
           digitalWrite(PIN_APOGEE, HIGH); 
           apogee_fire_time = now_ms;
@@ -399,13 +427,15 @@ void flight_control_task(void*) {
         }
       }
       
-      // -- Main Paraşüt (Erkən Açılma Sığortası ilə) --
+      // Main Paraşüt 
       if (ap_fired && !mn_fired) {
-        // Raket 400m-ə qalxıbsa belə, 500m şərtindən əlavə, ən az 30m düşməsini gözləyir
-        bool reached_main_alt = (cur_alt <= 500.0f) && ((max_flight_alt - cur_alt) > 30.0f);
+        bool reached_main_alt = (cur_alt <= 500.0f) && ((max_alt - cur_alt) > 30.0f);
         
         if (reached_main_alt) { 
-          xSemaphoreTake(data_mutex, portMAX_DELAY); shared.main_fired = true; xSemaphoreGive(data_mutex);
+          xSemaphoreTake(data_mutex, portMAX_DELAY); 
+          shared.main_fired = true; 
+          shared.state = FS_MAIN;
+          xSemaphoreGive(data_mutex);
           current_state = FS_MAIN;
           digitalWrite(PIN_MAIN, HIGH); 
           main_fire_time = now_ms;
@@ -414,25 +444,27 @@ void flight_control_task(void*) {
         }
       }
 
-      // -- Yerə Oturma Deteksiyası --
-      // Hündürlükdən asılı deyil, yalnız sürətə (sabitlik) baxır.
+      // Yerə Oturma Deteksiyası 
       if (mn_fired && !is_landed) {
-        if (fabs(v_speed) < 0.5f) {
+        if (fabs(v_speed) < 0.5f && fabs(cur_alt - prev_landing_alt) < 0.5f) {
           landing_counter++;
-          if (landing_counter > 100) {  // 2 Saniyə hərəkətsiz
-            xSemaphoreTake(data_mutex, portMAX_DELAY); shared.is_landed = true; xSemaphoreGive(data_mutex);
+          if (landing_counter > 100) {  
+            xSemaphoreTake(data_mutex, portMAX_DELAY); 
+            shared.is_landed = true; 
+            shared.state = FS_LANDED;
+            xSemaphoreGive(data_mutex);
             current_state = FS_LANDED;
             play_buzzer_tone(3000, 2000);
             is_landed = true;
           }
-        } else { landing_counter = 0; }
+        } else { 
+          landing_counter = 0; 
+        }
+        prev_landing_alt = cur_alt;
       }
     }
 
-    xSemaphoreTake(data_mutex, portMAX_DELAY); shared.state = current_state; xSemaphoreGive(data_mutex);
-
-    // --- 6. PİRO KANAL SÖNDÜRÜCÜ (BROWN-OUT VƏ QISAQAPANMA QORUMASI) ---
-    // Atəşləmədən düz 1.5 saniyə sonra batareyanı qorumaq üçün cərəyan kəsilir
+    // --- 5. PİRO KANAL SÖNDÜRÜCÜ (Təhlükəsizlik) ---
     if (ap_fired && digitalRead(PIN_APOGEE) == HIGH && (now_ms - apogee_fire_time > 1500)) {
         digitalWrite(PIN_APOGEE, LOW); 
     }
@@ -479,7 +511,7 @@ void env_task(void*) {
     shared.aht_ok = aht_ok;
     if (bme_ok) {
       shared.bme_temp = kf_bme_temp.update(bt); shared.bme_hum = kf_bme_hum.update(bh); shared.bme_pres = kf_bme_pres.update(bp); 
-      shared.altitude = kf_altitude.update(calc_altitude(shared.bme_pres)); // Yalnız pozisiya hündürlüyünü süzür
+      shared.altitude = kf_altitude.update(calc_altitude(shared.bme_pres)); 
     }
     if (aht_ok) { shared.aht_temp = kf_aht_temp.update(at); shared.aht_hum = kf_aht_hum.update(ah); }
     xSemaphoreGive(data_mutex);
@@ -506,7 +538,8 @@ void imu_task(void*) {
       i2c_mark_result(health_bno, imu_ok, now);
       
       if (imu_ok) {
-        // SLERP SİLİNDİ! Gecikmə yoxdur. BNO055 Xam Kvaternionundan birbaşa istifadə
+        last_sensor_time = millis(); // SENSOR SAĞLAMDIR TƏSDİQİ (WATCHDOG ÜÇÜN)
+        
         xSemaphoreTake(data_mutex, portMAX_DELAY);
         shared.qw = qw; shared.qx = qx; shared.qy = qy; shared.qz = qz;
         shared.accel_x = ax; shared.accel_y = ay; shared.accel_z = az; 
@@ -524,37 +557,57 @@ void imu_task(void*) {
 }
 
 void gps_task(void*) {
-  static char gps_buf[100]; static int buf_idx = 0;
+  static char gps_buf[100]; 
+  static int buf_idx = 0;
+  
   for (;;) {
     while (Serial2.available()) {
       char c = Serial2.read();
+      
+      if (c == '$') { buf_idx = 0; }
+      
       if (c == '\n' || c == '\r') { 
-          if (buf_idx > 0) { gps_buf[buf_idx] = '\0'; parse_gps_line(gps_buf); buf_idx = 0; } 
-      } else if (buf_idx < 99) { gps_buf[buf_idx++] = c; }
+        if (buf_idx > 10) { 
+          gps_buf[buf_idx] = '\0'; 
+          parse_gps_line(gps_buf); 
+        } 
+        buf_idx = 0; 
+      } else if (buf_idx < 99) { 
+        gps_buf[buf_idx++] = c; 
+      } else {
+        buf_idx = 0; 
+      }
     }
     vTaskDelay(pdMS_TO_TICKS(10));
   }
 }
 
 void setup() {
-  Serial1.begin(115200); Serial2.begin(9600); Serial3.begin(115200); Serial6.begin(115200);
+  IWatchdog.begin(2000000); // 2 Saniyəlik Qoruyucu Watchdog
+  IWatchdog.reload();
+
+  // STM32F407 üçün standart HardwareSerial interfeyslərinin birbaşa başladılması
+  Serial1.begin(115200); 
+  Serial2.begin(9600); 
+  Serial3.begin(115200); 
+  Serial6.begin(115200);
   
   pinMode(BUZZER_PIN, OUTPUT);
   pinMode(PIN_APOGEE, OUTPUT); digitalWrite(PIN_APOGEE, LOW);
   pinMode(PIN_MAIN, OUTPUT); digitalWrite(PIN_MAIN, LOW);
   
-  delay(1500);
+  wd_delay(1500);
   
   Wire.begin(); 
   Wire.setClock(400000);
   
-  // I2C DEADLOCK (BLOKLANMA) SIĞORTASI
-  #if defined(ARDUINO_ARCH_STM32)
-  Wire.setWireTimeout(25000, true); 
-  #endif
+  bme280_init(); 
+  wd_delay(10);
   
-  bme280_init(); delay(10);
-  bno055_init(); init_altitude_ref();
+  wd_delay(700); 
+  bno055_init(); 
+  
+  init_altitude_ref();
   
   kf_bme_temp.init(0.005f, 0.25f); kf_bme_hum.init(0.05f, 9.0f); kf_bme_pres.init(0.05f, 1.0f);
   kf_altitude.init(0.1f, 4.0f); kf_aht_temp.init(0.005f, 0.09f); kf_aht_hum.init(0.05f, 4.0f);
@@ -562,11 +615,11 @@ void setup() {
   
   i2c_mutex = xSemaphoreCreateMutex(); data_mutex = xSemaphoreCreateMutex();
   
-  xTaskCreate(tx_task, "TX", 512, NULL, 4, NULL);
+  xTaskCreate(flight_control_task, "FLIGHT", 512, NULL, 4, NULL);
   xTaskCreate(imu_task, "IMU", 512, NULL, 3, NULL);
   xTaskCreate(gps_task, "GPS", 384, NULL, 2, NULL);
+  xTaskCreate(tx_task, "TX", 512, NULL, 1, NULL); 
   xTaskCreate(env_task, "ENV", 512, NULL, 1, NULL); 
-  xTaskCreate(flight_control_task, "FLIGHT", 512, NULL, 4, NULL);
   
   vTaskStartScheduler();
 }
