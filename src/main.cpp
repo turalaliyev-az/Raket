@@ -93,6 +93,7 @@ struct SensorData {
   bool apogee_fired = false;
   bool main_fired = false;
   bool is_landed = false;
+  bool sensor_degraded = false;   // Sensör canlılığı diagnostik bayrağı
   
   // Non-blocking Buzzer Request Flags
   uint16_t buzz_req_freq = 0;
@@ -471,7 +472,7 @@ static void tx_send_frame(const SensorData &s, uint8_t type) {
   f.vertical_speed = f_i16(s.vertical_speed, 100.0f);
   
   f.state = (uint8_t)s.state;
-  f.flags = (s.gps_fix?1:0) | (s.bno_ok?2:0) | (s.bme_ok?4:0) | (s.aht_ok?8:0);
+  f.flags = (s.gps_fix?1:0) | (s.bno_ok?2:0) | (s.bme_ok?4:0) | (s.aht_ok?8:0) | (s.sensor_degraded?16:0);
   f.bno_calib = s.bno_calib;
   f.crc16 = crc16_ccitt(((const uint8_t*)&f) + 4, payload_len);
   
@@ -711,6 +712,9 @@ void flight_control_task(void*) {
       }
     }
 
+    // Sensör canlılığı diagnostikası (watchdog-dan bağımsız, yalnız telemetriya üçün)
+    bool sensor_degraded = ((int32_t)(now - last_sensor_activity) >= SENSOR_ALIVE_WINDOW_MS);
+
     // Atomik Snapshot Yazma
     xSemaphoreTake(data_mutex, portMAX_DELAY);
     shared.state = new_state;
@@ -720,6 +724,7 @@ void flight_control_task(void*) {
     shared.apogee_fired = snap.apogee_fired;
     shared.main_fired = snap.main_fired;
     shared.is_landed = snap.is_landed;
+    shared.sensor_degraded = sensor_degraded;
     shared.buzz_req_freq = snap.buzz_req_freq;
     shared.buzz_req_dur = snap.buzz_req_dur;
     xSemaphoreGive(data_mutex);
@@ -734,9 +739,9 @@ void flight_control_task(void*) {
         piro_mn_active = false;
     }
 
-    if ((int32_t)(millis() - last_sensor_activity) < SENSOR_ALIVE_WINDOW_MS) {
-      IWatchdog.reload();
-    }
+    // Watchdog hər zaman reload edilir — sensör canlılığına bağlı deyil.
+    // (Rampada >10 saniyə gözləyərkən I2C tıxanması sistemi resetləməsin.)
+    IWatchdog.reload();
 
     vTaskDelayUntil(&t, pdMS_TO_TICKS(TASK_PERIOD_MS));
   }
@@ -744,7 +749,7 @@ void flight_control_task(void*) {
 
 void tx_task(void*) {
   TickType_t t = xTaskGetTickCount();
-  Serial1.println("ms,state,alt_m,vs_ms,total_g,temp_C,pres_hPa,tilt_deg,lat,lon,fix,sats,bno,bme,aht,calib");
+  Serial1.println("ms,state,alt_m,vs_ms,total_g,temp_C,pres_hPa,tilt_deg,lat,lon,fix,sats,bno,bme,aht,calib,degraded");
   for (;;) {
     SensorData snap;
     xSemaphoreTake(data_mutex, portMAX_DELAY);
@@ -773,7 +778,8 @@ void tx_task(void*) {
     Serial1.print(snap.bno_ok); Serial1.print(',');
     Serial1.print(snap.bme_ok); Serial1.print(',');
     Serial1.print(snap.aht_ok); Serial1.print(',');
-    Serial1.println(snap.bno_calib);
+    Serial1.print(snap.bno_calib); Serial1.print(',');
+    Serial1.println(snap.sensor_degraded ? 1 : 0);
 
     vTaskDelayUntil(&t, pdMS_TO_TICKS(TX_PERIOD_MS));
   }
